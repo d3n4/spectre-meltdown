@@ -7,7 +7,7 @@
 # the Free Software Foundation, either version 3 of the License, or
 # (at your option) any later version.
 
-# Version: 1.3
+# Version: 2.1
 
 # Warning! Be sure to download the latest version of this script from its primary source:
 # https://access.redhat.com/security/vulnerabilities/speculativeexecution
@@ -94,8 +94,7 @@ check_supported_kernel() {
 
     # Check supported platform
     if [[ "$running_kernel" != *".el"[5-7]* ]]; then
-        echo -e "${RED}This script is meant to be used only on Red Hat Enterprise"
-        echo -e "Linux 5, 6 and 7.${RESET}"
+        echo "This script is meant to be used only on Red Hat Enterprise Linux 5, 6 and 7."
         exit 1
     fi
 }
@@ -144,162 +143,146 @@ check_cpu_vendor() {
 }
 
 
-check_variants_runtime() {
-    # Performs runtime check for mitigation.
-    #
-    # Args:
-    #     vendor - vendor string
+gather_info() {
+    # Gathers all available information and stores it in global variables.
     #
     # Side effects:
-    #     Overwrites global variables `variant_1`, `variant_2`, and `variant_3`.
-    #
-    # Returns:
-    #     0 if check was successful, 1 if fallback detection is needed
+    #     Sets many global boolean flags
     #
     # Notes:
-    #     MOCK_DEBUG_X86_PATH can be used to mock /sys/kernel/debug/x86 file
+    #     MOCK_DEBUG_X86_PATH can be used to mock /sys/kernel/debug/x86 directory
+    #     MOCK_CMDLINE_PATH can be used to mock /proc/cmdline file
+    #     MOCK_EUID can be used to mock EUID variable
 
     local debug_x86=${MOCK_DEBUG_X86_PATH:-/sys/kernel/debug/x86}
-    local vendor="$1"
+    local cmdline_path=${MOCK_CMDLINE_PATH:-/proc/cmdline}
+    local euid=${MOCK_EUID:-$EUID}
 
-    if [[ "$vendor" == "AMD" ]]; then
-        variant_3="AMD is not vulnerable to this variant"
+    # Am I root?
+    if (( euid == 0 )); then
+        root=1
     fi
 
-    if [[ -r "$debug_x86" ]]; then
-        echo "/sys/kernel/debug/x86 is mounted and accessible"
-        echo
-        if [[ -r "${debug_x86}/pti_enabled" && -r "${debug_x86}/ibpb_enabled" && -r "${debug_x86}/ibrs_enabled" ]]; then
-            echo "The following files are accessible:"
-            echo "/sys/kernel/debug/x86/pti_enabled, /sys/kernel/debug/x86/ibpb_enabled, /sys/kernel/debug/x86/ibrs_enabled"
-            echo "Checking files..."
-            echo
-            pti_enabled=$( <"${debug_x86}/pti_enabled" )
-            ibpb_enabled=$( <"${debug_x86}/ibpb_enabled" )
-            ibrs_enabled=$( <"${debug_x86}/ibrs_enabled" )
-
-            variant_1="Mitigated"
-
-            if [[ "$vendor" == "Intel" ]]; then
-                if (( pti_enabled == 1 && ibrs_enabled == 1 && ibpb_enabled == 1 )); then
-                    variant_2="Mitigated"
-                    variant_3="Mitigated"
-                fi
-                if (( pti_enabled == 1 && ibrs_enabled == 2 && ibpb_enabled == 1 )); then
-                    variant_2="Mitigated"
-                    variant_3="Mitigated"
-                fi
-                if (( pti_enabled == 1 && ibrs_enabled == 0 && ibpb_enabled == 0 )); then
-                    variant_3="Mitigated"
-                fi
-            fi
-
-            if [[ "$vendor" == "AMD" ]]; then
-                if (( pti_enabled == 0 && ibrs_enabled == 0 && ibpb_enabled == 2 )); then
-                    variant_2="Mitigated"
-                fi
-                if (( pti_enabled == 0 && ibrs_enabled == 2 && ibpb_enabled == 1 )); then
-                    variant_2="Mitigated"
-                fi
-            fi
-
-            return 0
-        else
-            echo "Some of the following files are not accessible:"
-            echo "/sys/kernel/debug/x86/pti_enabled, /sys/kernel/debug/x86/ibpb_enabled, /sys/kernel/debug/x86/ibrs_enabled"
-            echo
-        fi
-    else
-        echo "/sys/kernel/debug/x86 is either not mounted or not accessible"
-        echo "Run this script with elevated privileges (e.g. as root) and make sure that debugfs"
-        echo "is mounted. You can mount the debugfs by running:"
-        echo "# mount -t debugfs nodev /sys/kernel/debug"
-        echo
+    # Is debugfs mounted?
+    if mount | grep --quiet debugfs; then
+        mounted_debugfs=1
     fi
-    return 1
-}
 
+    # Will fallback detection be needed?
+    if (( ! mounted_debugfs || ! root )); then
+        fallback_needed=1
+    fi
 
-fallback_check() {
-    # Performs fallback (non-runtime) check for mitigation.
-    #
-    # Args:
-    #     vendor - vendor string
-    #
-    # Side effects:
-    #     Overwrites global variables `variant_1`, `variant_2`, and `variant_3`.
-    #
-    # Notes:
-    #     MOCK_CMDLINE_PATH can be used to mock /proc/cmdline file
+    # Are all debug files accessible?
+    if [[ -r "${debug_x86}/pti_enabled" && -r "${debug_x86}/ibpb_enabled" && -r "${debug_x86}/ibrs_enabled" ]]; then
+        all_debug_files=1
+    fi
 
-    cmdline_path=${MOCK_CMDLINE_PATH:-/proc/cmdline}
-    local vendor="$1"
+    # Read features from debugfs
+    if (( all_debug_files )); then
+        new_kernel=1
+        pti_debugfs=$( <"${debug_x86}/pti_enabled" )
+        ibpb_debugfs=$( <"${debug_x86}/ibpb_enabled" )
+        ibrs_debugfs=$( <"${debug_x86}/ibrs_enabled" )
+    fi
 
-    echo -e "${YELLOW}Fallback (non-runtime heuristics) check${RESET}. Checking dmesg..."
-    echo
-
+    # Read features from dmesg
     if ! dmesg | grep --quiet 'Linux.version'; then
-        echo -e "${YELLOW}It seems that dmesg circular buffer already wrapped,${RESET}"
-        echo -e "${YELLOW}the results may be inaccurate.${RESET}"
-        echo
+        dmesg_wrapped=1
     fi
 
-    # Variant #3
-    if [[ "$vendor" == "AMD" ]]; then
-        variant_3="AMD is not vulnerable to this variant"
+    # These will not appear if disabled from commandline
+    if dmesg | grep --quiet -e 'x86/pti: Unmapping kernel while in userspace' \
+                            -e 'x86/pti: Kernel page table isolation enabled' \
+                            -e 'x86/pti: Xen PV detected, disabling' \
+                            -e 'x86/pti: Xen PV detected, disabling PTI protection'; then
+        new_kernel=1
+        pti_dmesg=1
     fi
 
-    if [[ "$vendor" == "Intel" ]]; then
-        if dmesg | grep --quiet 'x86/pti: Unmapping kernel while in userspace'; then
-            variant_1="Mitigated"
-            if ! grep --quiet 'nopti' "$cmdline_path"; then
-                variant_3="Mitigated"
-            fi
-        fi
-
-        # Xen check
-        if dmesg | grep --quiet 'x86/pti: Xen PV detected, disabling'; then
-            variant_1="Mitigated"
-            if ! grep --quiet 'nopti' "$cmdline_path"; then
-                variant_3="Mitigated"
-            fi
-        fi
-    fi
-
-    # Variant #2
-    ibrs=0
-    ibpb=0
-    local line
-
+    # These will appear if disabled from commandline
     line=$( dmesg | tac | grep --max-count 1 'FEATURE SPEC_CTRL' )  # Check last
     if [[ "$line" ]]; then
-        variant_1="Mitigated"
+        new_kernel=1
         if ! grep --quiet 'Not Present' <<< "$line"; then
-            if ! grep --quiet 'noibrs' "$cmdline_path"; then
-                ibrs=1
-            fi
+            ibrs_dmesg=1
+            hw_support=1
+        else
+            not_ibrs_dmesg=1
         fi
     fi
 
     line=$( dmesg | tac | grep --max-count 1 'FEATURE IBPB_SUPPORT' )   # Check last
     if [[ "$line" ]]; then
-        variant_1="Mitigated"
+        new_kernel=1
         if ! grep --quiet 'Not Present' <<< "$line"; then
-            if ! grep --quiet 'noibpb' "$cmdline_path"; then
-                ibpb=1
+            ibpb_dmesg=1
+            hw_support=1
+        else
+            not_ibpb_dmesg=1
+        fi
+    fi
+
+    # Read commandline
+    if grep --quiet 'nopti' "$cmdline_path"; then
+        nopti=1
+    fi
+    if grep --quiet 'noibrs' "$cmdline_path"; then
+        noibrs=1
+    fi
+    if grep --quiet 'noibpb' "$cmdline_path"; then
+        noibpb=1
+    fi
+}
+
+
+check_variants() {
+    # Checks which variants are mitigated based on many global boolean flags.
+    #
+    # Side effects:
+    #     Sets global variables variant_1, variant_2, variant_3.
+
+    if (( new_kernel )); then
+        variant_1="Mitigated"
+    fi
+
+    if [[ "$vendor" == "Intel" ]]; then
+        if (( ! fallback_needed )); then
+            if (( pti_debugfs == 1 && ibrs_debugfs == 1 && ibpb_debugfs == 1 )); then
+                variant_2="Mitigated"
+                variant_3="Mitigated"
+            fi
+            if (( pti_debugfs == 1 && ibrs_debugfs == 2 && ibpb_debugfs == 1 )); then
+                variant_2="Mitigated"
+                variant_3="Mitigated"
+            fi
+            if (( pti_debugfs == 1 && ibrs_debugfs == 0 && ibpb_debugfs == 0 )); then
+                variant_3="Mitigated"
+            fi
+        else
+            if (( ibrs_dmesg && ibpb_dmesg && ! noibrs && ! noibpb )); then
+                variant_2="Mitigated"
+            fi
+            if (( pti_dmesg )); then
+                variant_3="Mitigated"
             fi
         fi
     fi
 
-    if [[ "$vendor" == "Intel" ]]; then
-        if (( ibrs == 1 && ibpb == 1 )); then
-            variant_2="Mitigated"
-        fi
-    fi
-
     if [[ "$vendor" == "AMD" ]]; then
-        if (( ibpb == 1 )); then
-            variant_2="Mitigated"
+        variant_3="AMD is not vulnerable to this variant"
+
+        if (( ! fallback_needed )); then
+            if (( pti_debugfs == 0 && ibrs_debugfs == 0 && ibpb_debugfs == 2 )); then
+                variant_2="Mitigated"
+            fi
+            if (( pti_debugfs == 0 && ibrs_debugfs == 2 && ibpb_debugfs == 1 )); then
+                variant_2="Mitigated"
+            fi
+        else
+            if (( ibpb_dmesg && ! noibpb )); then
+                variant_2="Mitigated"
+            fi
         fi
     fi
 }
@@ -312,34 +295,70 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     check_supported_kernel "$running_kernel"
 
     rhel=$( get_rhel "$running_kernel" )
-    if [[ "$rhel" == "5" ]]; then
+    if (( rhel == 5 )); then
         export PATH='/sbin':$PATH
+
+        echo "RHEL5 is not supported by the script at the moment."
+        exit 1
     fi
+
+    vendor=$( check_cpu_vendor )
+    if (( $? == 1 )); then
+        echo "Your CPU vendor is not supported by the script at the moment."
+        echo "Only Intel and AMD are supported for now."
+        exit 1
+    fi
+
+    root=0
+    mounted_debugfs=0
+    all_debug_files=0
+    fallback_needed=0
+    pti_debugfs=0
+    ibrs_debugfs=0
+    ibpb_debugfs=0
+    dmesg_wrapped=0
+    pti_dmesg=0
+    ibrs_dmesg=0
+    ibpb_dmesg=0
+    not_ibrs_dmesg=0
+    not_ibpb_dmesg=0
+    new_kernel=0
+    nopti=0
+    noibrs=0
+    noibpb=0
+    hw_support=0
 
     variant_1="Vulnerable"
     variant_2="Vulnerable"
     variant_3="Vulnerable"
 
     # Tests
-    vendor=$( check_cpu_vendor )
-    if (( $? == 1 )); then
-        echo -e "${RED}Your CPU vendor is not supported by the script at the moment.${RESET}"
-        echo -e "Only Intel and AMD are supported for now."
-        exit 1
-    fi
-    check_variants_runtime "$vendor"
-    if (( $? == 1 )); then
-        fallback_check "$vendor"
-    fi
+    gather_info
+    check_variants
 
     # Debug prints
     if [[ "$debug" ]]; then
+        echo "running_kernel = *$running_kernel*"
+        echo "rhel = *$rhel*"
         echo "vendor = *$vendor*"
-        echo "pti_enabled = *$pti_enabled*"
-        echo "ibpb_enabled = *$ibpb_enabled*"
-        echo "ibrs_enabled = *$ibrs_enabled*"
-        echo "ibrs (fallback) = *$ibrs*"
-        echo "ibpb (fallback) = *$ibpb*"
+        echo "root = *$root*"
+        echo "mounted_debugfs = *$mounted_debugfs*"
+        echo "all_debug_files = *$all_debug_files*"
+        echo "fallback_needed = *$fallback_needed*"
+        echo "pti_debugfs = *$pti_debugfs*"
+        echo "ibrs_debugfs = *$ibrs_debugfs*"
+        echo "ibpb_debugfs = *$ibpb_debugfs*"
+        echo "dmesg_wrapped = *$dmesg_wrapped*"
+        echo "pti_dmesg = *$pti_dmesg*"
+        echo "ibrs_dmesg = *$ibrs_dmesg*"
+        echo "ibpb_dmesg = *$ibpb_dmesg*"
+        echo "not_ibrs_dmesg = *$not_ibrs_dmesg*"
+        echo "not_ibpb_dmesg = *$not_ibpb_dmesg*"
+        echo "new_kernel = *$new_kernel*"
+        echo "nopti = *$nopti*"
+        echo "noibrs = *$noibrs*"
+        echo "noibpb = *$noibpb*"
+        echo "hw_support = *$hw_support*"
         echo "variant_1 = *$variant_1*"
         echo "variant_2 = *$variant_2*"
         echo "variant_3 = *$variant_3*"
@@ -347,6 +366,36 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
     fi
 
     # Results
+    if (( new_kernel )); then
+        kernel_with_patches="${GREEN}OK${RESET}"
+        if (( hw_support )); then
+            hw="${GREEN}YES${RESET}"
+        else
+            hw="${RED}NO${RESET}"
+        fi
+    else
+        kernel_with_patches="${RED}Not installed${RESET}"
+        hw="${YELLOW}Cannot detect without updated kernel${RESET}"
+    fi
+
+    if (( nopti )); then
+        pti="${RED}Disabled on kernel commandline by 'nopti'${RESET}"
+    else
+        pti="Not disabled on kernel commandline"
+    fi
+
+    if (( noibrs )); then
+        ibrs="${RED}Disabled on kernel commandline by 'noibrs'${RESET}"
+    else
+        ibrs="Not disabled on kernel commandline"
+    fi
+
+    if (( noibpb )); then
+        ibpb="${RED}Disabled on kernel commandline by 'noibpb'${RESET}"
+    else
+        ibpb="Not disabled on kernel commandline"
+    fi
+
     (( result = 0 ))
     if [[ "$variant_1" == "Vulnerable" ]]; then
         (( result |= 2 ))
@@ -367,12 +416,76 @@ if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
         variant_3="${GREEN}$variant_3${RESET}"
     fi
 
-    echo -e "Detected CPU vendor is: ${BOLD}$vendor${RESET}"
+    # Output
+    echo -e "Detected CPU vendor: ${BOLD}$vendor${RESET}"
+    echo -e "Running kernel: ${BOLD}$running_kernel${RESET}"
     echo
+
+    # Warnings
+    if (( fallback_needed )); then
+        echo -e "${YELLOW}Fallback non-runtime heuristics check is used (reading dmesg messages)${RESET},"
+        echo -e "because debugfs could not be read."
+        echo
+        echo "To improve mitigation detection:"
+        if (( ! mounted_debugfs )); then
+            echo "* Mount debugfs by following command:"
+            if (( rhel == 5 || rhel == 6 )); then
+                echo "    # mount -t debugfs nodev /sys/kernel/debug"
+            fi
+            if (( rhel == 7 )); then
+                echo "    # systemctl restart sys-kernel-debug.mount"
+            fi
+        fi
+        if (( ! root )); then
+            echo "* Run this script with elevated privileges (e.g. as root)"
+        fi
+        echo
+    fi
+
+    if (( dmesg_wrapped )); then
+        echo -e "${YELLOW}It seems that dmesg circular buffer already wrapped,${RESET}"
+        echo -e "${YELLOW}the results may be inaccurate.${RESET}"
+        echo
+    fi
+
+    # Variants
     echo -e "Variant #1 (Spectre): $variant_1"
-    echo -e "Variant #2 (Spectre): $variant_2"
-    echo -e "Variant #3 (Meltdown): $variant_3"
+    echo -e "CVE-2017-5753 - speculative execution bounds-check bypass"
+    echo -e "   - Kernel with mitigation patches: $kernel_with_patches"
     echo
+
+    echo -e "Variant #2 (Spectre): $variant_2"
+    echo -e "CVE-2017-5715 - speculative execution branch target injection"
+    echo -e "   - Kernel with mitigation patches: $kernel_with_patches"
+    echo -e "   - HW support / updated microcode: $hw"
+    echo -e "   - IBRS: $ibrs"
+    echo -e "   - IBPB: $ibpb"
+    echo
+
+    echo -e "Variant #3 (Meltdown): $variant_3"
+    echo -e "CVE-2017-5754 - speculative execution permission faults handling"
+    if [[ "$vendor" == "AMD" ]]; then
+        echo -e "   - AMD CPU: ${GREEN}OK${RESET}"
+    else
+        echo -e "   - Kernel with mitigation patches: $kernel_with_patches"
+        echo -e "   - PTI: $pti"
+    fi
+    echo
+
+    if (( result != 0 )); then
+        echo "Red Hat recommends that you:"
+        if (( ! new_kernel )); then
+            echo -e "* Update your kernel and reboot the system."
+        fi
+        if (( ! hw_support )); then
+            echo -e "* Ask your HW vendor for CPU microcode update."
+        fi
+        if (( noibrs || noibpb || nopti )); then
+            echo -e "* Remove kernel commandline options as noted above."
+        fi
+        echo
+    fi
+
     echo -e "For more information see:"
     echo -e "https://access.redhat.com/security/vulnerabilities/speculativeexecution"
     exit "$result"
